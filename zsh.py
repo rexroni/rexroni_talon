@@ -11,8 +11,6 @@ import selectors
 import threading
 import traceback
 
-from . import files
-from . import display
 from . import singletons
 
 ctx = Context()
@@ -39,30 +37,10 @@ ctx.lists["user.shell_command"] = {
     "g": "g",
     "grep": "grep",
     "excel": "xsel",
+    "rm": "rm",
+    "mkdir": "mkdir",
+    "rmdir": "rmdir",
 }
-
-# make a directory for completions from every zsh pid.
-COMPLETIONS_DIR = os.path.join(os.path.dirname(__file__), "updates", "zsh_completions")
-os.makedirs(COMPLETIONS_DIR, exist_ok=True)
-
-def on_completion_update(relpath, path, exists):
-    basename = os.path.basename(relpath)
-    # get the window id that was updated from the filename
-    matches = re.match("([0-9]+).csv", basename)
-    if matches is None:
-        return
-    window = int(matches[1])
-    # ignore non-active windows
-    if window != display.get_active_window().id:
-        return
-    if not exists:
-        ctx.lists["user.zsh_completion"] = {}
-    with open(path) as f:
-        update = files.csv_to_dict(f)
-        print(update)
-        ctx.lists["user.zsh_completion"] = update
-
-files.add_updates_callback("zsh_completions/", on_completion_update)
 
 @mod.capture(rule="{user.shell_command}")
 def shell_command(m) -> str:
@@ -118,110 +96,246 @@ class main_action:
         # actions.next() is how you reference the action you are overriding.
         actions.next(key)
 
+def extensions(x):
+    x = re.sub("\\.py$", " dot pie", x)
+    x = re.sub("\\.c$", " dot see", x)
+    x = re.sub("\\.h$", " dot h", x)
+    x = re.sub("\\.sh$", " dot s h", x)
+    return x
 
-class ZshConnection:
-    def __init__(self, conn):
-        self.conn = conn
-        # store up all the packets received and return them when the connection
-        # is closed (one command per connection)
-        self.packets = []
-
-    # returns a command body when the connection is closed
-    def recv(self):
-        data = self.conn.recv(4096)
-        if not data:
-            # connection is broken, cmd is ended
-            self.conn.close()
-            return b''.join(self.packets)
-        self.packets.append(data)
-        return None
+def speakify(x, specials):
+    specials = specials or ""
+    x = re.sub("\\.", " dot " if '.' in specials else ' ', x)
+    x = re.sub("_", " under " if '_' in specials else ' ', x)
+    x = re.sub("-", " dash " if '-' in specials else ' ', x)
+    # talon pukes on multiple spaces
+    x = re.sub(" +", " ", x)
+    # talon also pukes on leading spaces
+    return x.strip()
 
 
-class ZshServer:
-    def __init__(self, port=8468):
-        self.port = port
-        self.sock = None
+def get_pronunciations(symbol):
+    out = {}
+
+    # skip anything with a slash?
+    # TODO: this breaks multi-stage completions.
+    if '/' in symbol:
+        return out
+
+    # always start with pronouncing extensions
+    x = extensions(symbol)
+
+    # then try to support the plainest form
+    out[speakify(x, None)] = symbol
+
+    # support the most explicit form
+    out[speakify(x, '._-')] = symbol
+
+    # support the one-of-each forms
+    out[speakify(x, '.')] = symbol
+    out[speakify(x, '_')] = symbol
+    out[speakify(x, '-')] = symbol
+
+    return out
+
+
+class Zsh:
+    def __init__(self, pid, selector):
+        self.pid = pid
+        self.selector = selector
+        self.sock = socket.socket(family=socket.AF_UNIX)
+        self.recvd = []
+        self.recvd_buf = b''
+        self.send_buf = b''
+        self.completions = {}
+
+        # print(f'new Zsh({pid})!')
+
+        # There is a race condition where this hangs, unfortunately.
+        # If the zsh line editor is not active, the zsh completion server
+        # cannot accept connections and incoming connections can hang.
+        # The good news is that it seems the first two connections do not hang
+        # and we should only ever make one connection to each zsh server.
+        try:
+            self.sock.connect(f"/run/zsh-completion-server/{pid}.sock")
+        except Exception as e:
+            self.sock.close()
+            print('connection failed:', e)
+            raise
+
+        self.sock.setblocking(False)
+        self.selector.register(self.sock, self._event_mask(), self)
+
+    def _event_mask(self):
+        if self.send_buf:
+            return selectors.EVENT_READ | selectors.EVENT_WRITE
+        return selectors.EVENT_READ
+
+    def queue_send(self, msg):
+        # Only safe to call inside the event loop.
+        self.send_buf += msg
+        self.selector.modify(self.sock, self._event_mask(), self)
+
+    def event(self, readable, writable):
+        if readable:
+            msg = self.sock.recv(4096)
+            if not msg:
+                # Broken connection.
+                self.close()
+                return
+            self.recvd_buf += msg
+            last_newline = self.recvd_buf.rfind(b'\n')
+            if last_newline != -1:
+                # commit complete lines to recvd
+                self.recvd.extend(self.recvd_buf[:last_newline].split(b'\n'))
+                self.recvd_buf = self.recvd_buf[last_newline + 1:]
+                self.check_cmd()
+
+        if writable:
+            written = self.sock.send(self.send_buf)
+            if written == 0:
+                # Broken connection.
+                self.close()
+                return
+            self.send_buf = self.send_buf[written:]
+            self.selector.modify(self.sock, self._event_mask(), self)
+
+    def check_cmd(self):
+        if not self.recvd:
+            return
+        # cmd will be like 'CMD:ARG:ARG'
+        cmd = self.recvd[0].split(b':')
+        # Right now we only allow one command.
+        assert cmd[0] == b'completions', f'command {cmd} not valid'
+        try:
+            end = self.recvd.index(b"::done::")
+        except ValueError:
+            return
+        assert len(self.recvd) >= 4, "not enough lines in response"
+        context = self.recvd[1]
+        prefix = self.recvd[2]
+        raw_completions = self.recvd[3:end]
+        self.recvd = self.recvd[end+1:]
+        self.handle_completions(context, prefix, raw_completions)
+
+    def handle_completions(self, context, prefix, raw_completions):
+        # For blank commands, we use a custom command list for completion and
+        # ignore the huge list from zsh.
+
+        if prefix == b'' and context in [
+            b":complete:-command-:",
+            b":complete:-sudo-:",
+            b":complete:-env-:",
+        ]:
+            raw_completions = []
+
+        completions = {}
+        for symbol in raw_completions:
+            completions.update(get_pronunciations(symbol.decode("utf8")))
+        # TODO: post-process with prefix somehow?
+
+        # cache these completions for later
+        self.completions = completions
+        # if we are active, update the list of zsh_completions
+        if self.is_active_window():
+            print(completions)
+            ctx.lists["user.zsh_completion"] = self.completions
+
+    def is_active_window(self):
+        window = ui.active_window()
+        if not window.title.startswith("zsh:"):
+            return False
+        active_pid = int(window.title.split(':')[1])
+        return active_pid == self.pid
+
+    def close(self):
+        self.selector.unregister(self.sock)
+        self.sock.close()
+
+
+class ZshPool:
+    def __init__(self):
+        # Open a control channel.  ctrl_r will be part of the event loop,
+        # ctrl_w is for outside of the event loop.
+        self.ctrl_r, self.ctrl_w = socket.socketpair()
+        self.ctrl_r.setblocking(False)
+
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.ctrl_r, selectors.EVENT_READ)
+
+        # shells maps pids to Zsh objects.
+        self.shells = {}
         self.thread = None
-        self.quitting = False
 
     def start(self):
         self.thread = threading.Thread(target=self._run)
         self.thread.start()
         return self
 
-    def _handle_listener(self):
-        conn, _ = self.listener.accept()
-        conn.setblocking(False)
-        c = ZshConnection(conn)
-        self.selector.register(conn, selectors.EVENT_READ, c)
-
-    def _handle_data(self, c):
-        msg = c.recv()
-        if msg:
-            print(f"msg received: {msg}")
-            # done with connection
-            self.selector.unregister(c.conn)
-
-            if msg.startswith(b'quit'):
-                self.quitting = True
+    def _trigger_pid(self, pid):
+        if pid not in self.shells:
+            # detected new shell
+            try:
+                zsh = Zsh(pid, self.selector)
+            except:
                 return
+            self.shells[pid] = zsh
+        zsh = self.shells[pid]
+        zsh.queue_send(b'trigger\n')
+
+    def _handle_ctrl(self):
+        msg = self.ctrl_r.recv(4096)
+        for line in msg.splitlines():
+            cmd = line.split(b":")
+            if cmd[0] == b"quit":
+                return True
+            if cmd[0] == b"trigger":
+                self._trigger_pid(int(cmd[1]))
+                continue
+            raise ValueError(f"unknown control message: {cmd}")
+        return False
 
     def _run(self):
-        # Create the listener.
-        with socket.socket() as self.listener:
-            self.listener.bind(("localhost", self.port))
-            self.listener.listen(5)
-            self.listener.setblocking(False)
+        while True:
+            for key, mask in self.selector.select():
+                if key.fileobj == self.ctrl_r:
+                    quit = self._handle_ctrl()
+                    if quit:
+                        return
+                else:
+                    readable = mask & selectors.EVENT_READ
+                    writable = mask & selectors.EVENT_WRITE
+                    zsh = key.data
+                    zsh.event(readable, writable)
 
-            with selectors.DefaultSelector() as self.selector:
-                self.selector.register(self.listener, selectors.EVENT_READ)
-
-                try:
-                    # main event loop
-                    while not self.quitting:
-                        for key, mask in self.selector.select():
-                            if key.fileobj == self.listener:
-                                # handle a new connection
-                                self._handle_listener()
-                                continue
-                            else:
-                                c = key.data
-                                self._handle_data(c)
-                                if self.quitting:
-                                    break
-                finally:
-                    self.selector.unregister(self.listener)
-                    self.listener.close()
-                    # unregister and close all connections
-                    # (make a copy of the dictionary so we can modify the
-                    # original as we iterate through the copy)
-                    for fileobj, key in dict(self.selector.get_map()).items():
-                        self.selector.unregister(fileobj)
-                        c = key.data
-                        c.conn.close()
-        print("quit loop")
+    def trigger(self, pid):
+        # print(f'trigger {pid}')
+        self.ctrl_w.send(b'trigger:%d\n'%pid)
 
     def close(self):
-        print('closing')
         if self.thread:
-            # send a "quit" message through the socket
-            try:
-                with socket.socket() as s:
-                    s.connect(('localhost', self.port))
-                    s.send(b'quit\n')
-            except Exception as e:
-                print(e)
-                pass
+            self.ctrl_w.send(b'quit\n')
             self.thread.join()
-        if self.sock:
-            self.sock.close()
+        self.selector.unregister(self.ctrl_r)
+        self.ctrl_r.close()
+        self.ctrl_w.close()
+
+        # unregister and close all Zsh objects
+        # (make a copy of the dictionary so we can modify the
+        # original as we iterate through the copy)
+        for _, key in dict(self.selector.get_map()).items():
+            zsh = key.data
+            zsh.close()
+
+        self.selector.close()
 
 
-# on reload, kill the old server
-if singletons.zsh_server is not None:
-    singletons.zsh_server.close()
-# start the new server
-singletons.zsh_server = ZshServer().start()
+# on reload, close the old pool
+if singletons.zsh_pool is not None:
+    singletons.zsh_pool.close()
+    singletons.zsh_pool = None
+# start the new pool
+singletons.zsh_pool = ZshPool().start()
 
 
 class ZshTriggerWatch:
@@ -229,25 +343,16 @@ class ZshTriggerWatch:
     Whenever a new zsh window is selected, reach out to the zsh completion
     server and have it tell us what its completion list is.
     """
-    def trigger_zsh(pid):
-        try:
-            with socket.socket(family=socket.AF_UNIX) as s:
-                s.connect(f'/run/zsh-completion-server/{pid}.sock')
-                s.send(b'trigger\n')
-        except Exception as e:
-            traceback.print_exc(e)
-            pass
-
     def win_focus(window):
         if window.title.startswith("zsh:"):
-            zsh_pid = int(window.title.split(':')[1])
-            ZshTriggerWatch.trigger_zsh(zsh_pid)
+            pid = int(window.title.split(':')[1])
+            singletons.zsh_pool.trigger(pid)
 
     def win_title(window):
         if window == ui.active_window():
             if window.title.startswith("zsh:"):
-                zsh_pid = int(window.title.split(':')[1])
-                ZshTriggerWatch.trigger_zsh(zsh_pid)
+                pid = int(window.title.split(':')[1])
+                singletons.zsh_pool.trigger(pid)
 
     ui.register('win_focus', win_focus)
     ui.register('win_title', win_title)

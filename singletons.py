@@ -3,4 +3,4 @@
 
 # If this file is ever updated, you'll need to restart talon.
 
-zsh_server = None
+zsh_pool = None
