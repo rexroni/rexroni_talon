@@ -4,9 +4,16 @@ This is my talon repository, where I put things which I hope will be generally
 useful for other people who also use talon.  Ideally, each part is easy to
 understand and is usable without any of the other parts.
 
+Install this repo into your `~/.talon/user` directory like this:
+
+```sh
+cd ~/.talon/user
+git clone https://github.com/rexroni/rexroni-talon
+```
+
 The current list of features is:
 
-* *Zsh completion recognition*: continuously register zsh completion with talon
+* **Zsh completion recognition**: continuously register zsh completion with talon
 
 ## Zsh completion recognition
 
@@ -23,7 +30,7 @@ from zsh for the next phrase.
   configurations.  If you are new to it, I recommend the `grml` package, which
   offers a like-bash-but-better experience with basically no effort.
 
-### Configuration
+### Zsh Configuration
 
 All you should have to do is `source` the `setup.zsh` file in your zsh:
 
@@ -34,7 +41,7 @@ source ~/.talon/user/rexroni-talon/zsh-completion-server/setup.zsh
 This will have the following effects:
 
 - It will start a completion server served over a unix socket in the
-  `zsh-completion-server/sock` directory (created automatically).
+  `rexroni-talon/zsh-completion-server/sock` directory (created automatically).
 
 - It will set your terminal emulator's window title to `zsh:$PID:$PWD`,
   which the `zsh.py` talon module will use to identify which completion
