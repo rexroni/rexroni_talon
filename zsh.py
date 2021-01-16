@@ -10,8 +10,11 @@ import contextlib
 import selectors
 import threading
 import traceback
+import logging
 
 from . import singletons
+
+HERE = os.path.dirname(__file__)
 
 ctx = Context()
 mod = Module()
@@ -38,7 +41,7 @@ ctx.lists["user.shell_command"] = {
     "grep": "grep",
     "excel": "xsel",
     "rm": "rm",
-    "mkdir": "mkdir",
+    "make dir": "mkdir",
     "rmdir": "rmdir",
 }
 
@@ -86,7 +89,7 @@ class main_action:
     def key(key: str):
         global _typed_special
         global _typed_anything
-        if key == 'enter' or '-' in key:
+        if key == 'enter' or ('-' in key and key != '-'):
             # Don't trigger extra key presses on special keys.
             _typed_special = True
         _typed_anything = True
@@ -101,6 +104,8 @@ def extensions(x):
     x = re.sub("\\.c$", " dot see", x)
     x = re.sub("\\.h$", " dot h", x)
     x = re.sub("\\.sh$", " dot s h", x)
+    x = re.sub("\\.zsh$", " dot z s h", x)
+    x = re.sub("\\.go$", " dot go", x)
     return x
 
 def speakify(x, specials):
@@ -108,33 +113,74 @@ def speakify(x, specials):
     x = re.sub("\\.", " dot " if '.' in specials else ' ', x)
     x = re.sub("_", " under " if '_' in specials else ' ', x)
     x = re.sub("-", " dash " if '-' in specials else ' ', x)
+    x = re.sub("/", " slash " if '/' in specials else ' ', x)
     # talon pukes on multiple spaces
     x = re.sub(" +", " ", x)
     # talon also pukes on leading spaces
     return x.strip()
 
+def shorthand(x):
+    s = re.sub('[._-/].*', '', x.lstrip('._-/'))
+    if s == x:
+        return None
+    return x
 
-def get_pronunciations(symbol):
+def get_pronunciations(symbol, prefix=""):
     out = {}
 
-    # skip anything with a slash?
-    # TODO: this breaks multi-stage completions.
-    if '/' in symbol:
-        return out
+    # We'll never re-type the prefix, ever.
+    typable = symbol[len(prefix):]
 
-    # always start with pronouncing extensions
-    x = extensions(symbol)
+    # If there is a symbol in the prefix, we never allow pronouncing before it.
+    # Think of pronouncing "--amend" when "--" is the prefix or "a/b" when "a/"
+    # is the prefix.  You wouldn't.
+    symboled_prefix = re.match('(.*[._/-])[^._/-]*$', prefix)
+    if symboled_prefix:
+        symboled_prefix = symboled_prefix[1]
+        symbol = symbol[len(symboled_prefix):]
+        prefix = prefix[len(symboled_prefix):]
 
-    # then try to support the plainest form
-    out[speakify(x, None)] = symbol
+    # Now, if you have half-typed a word to narrow down the completion options,
+    # support either the full (remaining) symbol, or just the part that is
+    # remaining.
+    variations = [(symbol, typable)]
+    if prefix:
+        variations.append((symbol[len(prefix):], typable))
 
-    # support the most explicit form
-    out[speakify(x, '._-')] = symbol
+    # Now, in case you want to pronounce just until the next symbol, we'll
+    # support typing that out and we'll type a tab afterwards to trigger the
+    # shell's tab completion (which allows us to not manually track prefixes)
+    shorthand = re.match('^([^._/-]*)[._/-].*$', symbol)
+    if shorthand:
+        shorthand = shorthand[1]
+        shortened_by = len(symbol) - len(shorthand)
+        typable = typable[:-shortened_by] + '\t'
 
-    # support the one-of-each forms
-    out[speakify(x, '.')] = symbol
-    out[speakify(x, '_')] = symbol
-    out[speakify(x, '-')] = symbol
+        variations.append((shorthand, typable))
+        if prefix:
+            shorthand = re.match('^([^._/-]*)[._/-].*$', symbol[len(prefix):])
+            if shorthand:
+                shorthand = shorthand[1]
+                variations.append((shorthand, typable))
+
+    for base, result in variations:
+        if not base:
+            continue
+
+        # always start with pronouncing extensions
+        base = extensions(base)
+
+        # then try to support the plainest form
+        out[speakify(base, None)] = result
+
+        # support the most explicit form
+        out[speakify(base, '._-/')] = result
+
+        # support the one-of-each forms
+        out[speakify(base, '.')] = result
+        out[speakify(base, '_')] = result
+        out[speakify(base, '-')] = result
+        out[speakify(base, '/')] = result
 
     return out
 
@@ -157,10 +203,10 @@ class Zsh:
         # The good news is that it seems the first two connections do not hang
         # and we should only ever make one connection to each zsh server.
         try:
-            self.sock.connect(f"/run/zsh-completion-server/{pid}.sock")
+            self.sock.connect(f"{HERE}/zsh-completion-server/sock/{pid}.sock")
         except Exception as e:
             self.sock.close()
-            print('connection failed:', e)
+            logging.warning('connection failed:', e)
             raise
 
         self.sock.setblocking(False)
@@ -231,14 +277,15 @@ class Zsh:
 
         completions = {}
         for symbol in raw_completions:
-            completions.update(get_pronunciations(symbol.decode("utf8")))
-        # TODO: post-process with prefix somehow?
+            completions.update(
+                get_pronunciations(symbol.decode("utf8"), prefix.decode("utf8"))
+            )
 
         # cache these completions for later
         self.completions = completions
         # if we are active, update the list of zsh_completions
         if self.is_active_window():
-            print(completions)
+            logging.debug(completions)
             ctx.lists["user.zsh_completion"] = self.completions
 
     def is_active_window(self):
