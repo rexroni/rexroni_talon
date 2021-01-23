@@ -13,6 +13,7 @@ import traceback
 import logging
 
 from . import singletons
+from . import events
 
 HERE = os.path.dirname(__file__)
 
@@ -186,9 +187,9 @@ def get_pronunciations(symbol, prefix=""):
 
 
 class Zsh:
-    def __init__(self, pid, selector):
+    def __init__(self, pid, ctx):
         self.pid = pid
-        self.selector = selector
+        self.ctx = ctx
         self.sock = socket.socket(family=socket.AF_UNIX)
         self.recvd = []
         self.recvd_buf = b''
@@ -210,7 +211,7 @@ class Zsh:
             raise
 
         self.sock.setblocking(False)
-        self.selector.register(self.sock, self._event_mask(), self)
+        self.ctx.register(self.sock, self._event_mask(), self)
 
     def _event_mask(self):
         if self.send_buf:
@@ -220,7 +221,7 @@ class Zsh:
     def queue_send(self, msg):
         # Only safe to call inside the event loop.
         self.send_buf += msg
-        self.selector.modify(self.sock, self._event_mask(), self)
+        self.ctx.modify(self.sock, self._event_mask(), self)
 
     def event(self, readable, writable):
         if readable:
@@ -244,7 +245,7 @@ class Zsh:
                 self.close()
                 return
             self.send_buf = self.send_buf[written:]
-            self.selector.modify(self.sock, self._event_mask(), self)
+            self.ctx.modify(self.sock, self._event_mask(), self)
 
     def check_cmd(self):
         if not self.recvd:
@@ -296,7 +297,7 @@ class Zsh:
         return active_pid == self.pid
 
     def close(self):
-        self.selector.unregister(self.sock)
+        self.ctx.unregister(self.sock)
         self.sock.close()
 
 
@@ -307,23 +308,39 @@ class ZshPool:
         self.ctrl_r, self.ctrl_w = socket.socketpair()
         self.ctrl_r.setblocking(False)
 
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.ctrl_r, selectors.EVENT_READ)
-
         # shells maps pids to Zsh objects.
         self.shells = {}
-        self.thread = None
 
-    def start(self):
-        self.thread = threading.Thread(target=self._run)
-        self.thread.start()
-        return self
+        self.closed = False
+        self.closer = threading.Condition()
+
+        # register ourselves with the event loop
+
+        class Consumer(events.EventConsumer):
+            def close(_):
+                self._close()
+
+            def event(_, key, mask):
+                self._event(key, mask)
+
+        with events.event_loop.register_lock() as register_consumer:
+            self.ctx = register_consumer(Consumer())
+            self.ctx.register(self.ctrl_r, selectors.EVENT_READ)
+
+    def _event(self, key, mask):
+        if key.fileobj == self.ctrl_r:
+            self._handle_ctrl()
+        else:
+            readable = mask & selectors.EVENT_READ
+            writable = mask & selectors.EVENT_WRITE
+            zsh = key.data
+            zsh.event(readable, writable)
 
     def _trigger_pid(self, pid):
         if pid not in self.shells:
             # detected new shell
             try:
-                zsh = Zsh(pid, self.selector)
+                zsh = Zsh(pid, self.ctx)
             except:
                 return
             self.shells[pid] = zsh
@@ -335,54 +352,56 @@ class ZshPool:
         for line in msg.splitlines():
             cmd = line.split(b":")
             if cmd[0] == b"quit":
-                return True
+                self._close()
+                return
             if cmd[0] == b"trigger":
                 self._trigger_pid(int(cmd[1]))
                 continue
             raise ValueError(f"unknown control message: {cmd}")
-        return False
 
-    def _run(self):
-        while True:
-            for key, mask in self.selector.select():
-                if key.fileobj == self.ctrl_r:
-                    quit = self._handle_ctrl()
-                    if quit:
-                        return
-                else:
-                    readable = mask & selectors.EVENT_READ
-                    writable = mask & selectors.EVENT_WRITE
-                    zsh = key.data
-                    zsh.event(readable, writable)
+    def _close(self):
+        """
+        _close() is only called from the event loop thread.
+        """
+        # this happens on the event loop thread, whether it was triggered by
+        # us reloading or by the event loop reloading
+        with self.closer:
+            if self.closed:
+                return
+            self.closed = True
 
-    def trigger(self, pid):
-        # print(f'trigger {pid}')
-        self.ctrl_w.send(b'trigger:%d\n'%pid)
+            self.ctx.unregister(self.ctrl_r)
+            self.ctrl_r.close()
+            self.ctrl_w.close()
+
+            # unregister and close all Zsh objects
+            for zsh in self.shells.values():
+                zsh.close()
+
+            self.closer.notify()
 
     def close(self):
-        if self.thread:
-            self.ctrl_w.send(b'quit\n')
-            self.thread.join()
-        self.selector.unregister(self.ctrl_r)
-        self.ctrl_r.close()
-        self.ctrl_w.close()
+        """
+        close() is only called from outside the event loop thread.
+        """
+        with self.closer:
+            if not self.closed:
+                self.ctrl_w.send(b'quit\n')
+                while not self.closed:
+                    self.closer.wait()
 
-        # unregister and close all Zsh objects
-        # (make a copy of the dictionary so we can modify the
-        # original as we iterate through the copy)
-        for _, key in dict(self.selector.get_map()).items():
-            zsh = key.data
-            zsh.close()
-
-        self.selector.close()
+    def trigger(self, pid):
+        with self.closer:
+            if not self.closed:
+                # print(f'trigger {pid}')
+                self.ctrl_w.send(b'trigger:%d\n'%pid)
 
 
-# on reload, close the old pool
-if singletons.zsh_pool is not None:
-    singletons.zsh_pool.close()
-    singletons.zsh_pool = None
-# start the new pool
-singletons.zsh_pool = ZshPool().start()
+@singletons.singleton
+def zsh_pool():
+    x = ZshPool()
+    yield x
+    x.close()
 
 
 class ZshTriggerWatch:
@@ -393,13 +412,13 @@ class ZshTriggerWatch:
     def win_focus(window):
         if window.title.startswith("zsh:"):
             pid = int(window.title.split(':')[1])
-            singletons.zsh_pool.trigger(pid)
+            zsh_pool.trigger(pid)
 
     def win_title(window):
         if window == ui.active_window():
             if window.title.startswith("zsh:"):
                 pid = int(window.title.split(':')[1])
-                singletons.zsh_pool.trigger(pid)
+                zsh_pool.trigger(pid)
 
     ui.register('win_focus', win_focus)
     ui.register('win_title', win_title)
