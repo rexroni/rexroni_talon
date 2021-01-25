@@ -3,7 +3,6 @@ from talon.scripting import core
 
 import os
 import typing
-import re
 import json
 import socket
 import contextlib
@@ -13,6 +12,7 @@ import traceback
 import logging
 
 from . import singletons
+from . import speakify
 from . import events
 
 HERE = os.path.dirname(__file__)
@@ -100,91 +100,6 @@ class main_action:
         # actions.next() is how you reference the action you are overriding.
         actions.next(key)
 
-def extensions(x):
-    x = re.sub("\\.py$", " dot pie", x)
-    x = re.sub("\\.c$", " dot see", x)
-    x = re.sub("\\.h$", " dot h", x)
-    x = re.sub("\\.sh$", " dot s h", x)
-    x = re.sub("\\.zsh$", " dot z s h", x)
-    x = re.sub("\\.go$", " dot go", x)
-    return x
-
-def speakify(x, specials):
-    specials = specials or ""
-    x = re.sub("\\.", " dot " if '.' in specials else ' ', x)
-    x = re.sub("_", " under " if '_' in specials else ' ', x)
-    x = re.sub("-", " dash " if '-' in specials else ' ', x)
-    x = re.sub("/", " slash " if '/' in specials else ' ', x)
-    # talon pukes on multiple spaces
-    x = re.sub(" +", " ", x)
-    # talon also pukes on leading spaces
-    return x.strip()
-
-def shorthand(x):
-    s = re.sub('[._-/].*', '', x.lstrip('._-/'))
-    if s == x:
-        return None
-    return x
-
-def get_pronunciations(symbol, prefix=""):
-    out = {}
-
-    # We'll never re-type the prefix, ever.
-    typable = symbol[len(prefix):]
-
-    # If there is a symbol in the prefix, we never allow pronouncing before it.
-    # Think of pronouncing "--amend" when "--" is the prefix or "a/b" when "a/"
-    # is the prefix.  You wouldn't.
-    symboled_prefix = re.match('(.*[._/-])[^._/-]*$', prefix)
-    if symboled_prefix:
-        symboled_prefix = symboled_prefix[1]
-        symbol = symbol[len(symboled_prefix):]
-        prefix = prefix[len(symboled_prefix):]
-
-    # Now, if you have half-typed a word to narrow down the completion options,
-    # support either the full (remaining) symbol, or just the part that is
-    # remaining.
-    variations = [(symbol, typable)]
-    if prefix:
-        variations.append((symbol[len(prefix):], typable))
-
-    # Now, in case you want to pronounce just until the next symbol, we'll
-    # support typing that out and we'll type a tab afterwards to trigger the
-    # shell's tab completion (which allows us to not manually track prefixes)
-    shorthand = re.match('^([^._/-]*)[._/-].*$', symbol)
-    if shorthand:
-        shorthand = shorthand[1]
-        shortened_by = len(symbol) - len(shorthand)
-        typable = typable[:-shortened_by] + '\t'
-
-        variations.append((shorthand, typable))
-        if prefix:
-            shorthand = re.match('^([^._/-]*)[._/-].*$', symbol[len(prefix):])
-            if shorthand:
-                shorthand = shorthand[1]
-                variations.append((shorthand, typable))
-
-    for base, result in variations:
-        if not base:
-            continue
-
-        # always start with pronouncing extensions
-        base = extensions(base)
-
-        # then try to support the plainest form
-        out[speakify(base, None)] = result
-
-        # support the most explicit form
-        out[speakify(base, '._-/')] = result
-
-        # support the one-of-each forms
-        out[speakify(base, '.')] = result
-        out[speakify(base, '_')] = result
-        out[speakify(base, '-')] = result
-        out[speakify(base, '/')] = result
-
-    return out
-
 
 class Zsh:
     def __init__(self, pid, ctx):
@@ -195,6 +110,7 @@ class Zsh:
         self.recvd_buf = b''
         self.send_buf = b''
         self.completions = {}
+        self.closed = False
 
         # print(f'new Zsh({pid})!')
 
@@ -279,7 +195,11 @@ class Zsh:
         completions = {}
         for symbol in raw_completions:
             completions.update(
-                get_pronunciations(symbol.decode("utf8"), prefix.decode("utf8"))
+                speakify.get_pronunciations(
+                    symbol.decode("utf8"),
+                    prefix.decode("utf8"),
+                    completer_char="\t",
+                )
             )
 
         # cache these completions for later
@@ -297,44 +217,38 @@ class Zsh:
         return active_pid == self.pid
 
     def close(self):
-        self.ctx.unregister(self.sock)
-        self.sock.close()
+        if not self.closed:
+            self.closed = True
+            self.ctx.unregister(self.sock)
+            self.sock.close()
 
 
-class ZshPool:
+class ZshPool(events.EventConsumer):
     def __init__(self):
-        # Open a control channel.  ctrl_r will be part of the event loop,
-        # ctrl_w is for outside of the event loop.
-        self.ctrl_r, self.ctrl_w = socket.socketpair()
-        self.ctrl_r.setblocking(False)
-
         # shells maps pids to Zsh objects.
         self.shells = {}
 
-        self.closed = False
-        self.closer = threading.Condition()
+        self.ctx = None
 
-        # register ourselves with the event loop
+    def startup(self, ctx):
+        self.ctx = ctx
 
-        class Consumer(events.EventConsumer):
-            def close(_):
-                self._close()
+    def shutdown(self):
+        # unregister and close all Zsh objects
+        for zsh in self.shells.values():
+            zsh.close()
 
-            def event(_, key, mask):
-                self._event(key, mask)
+    def event(self, key, mask):
+        readable = mask & selectors.EVENT_READ
+        writable = mask & selectors.EVENT_WRITE
+        zsh = key.data
+        zsh.event(readable, writable)
+        if zsh.closed:
+            del self.shells[zsh.pid]
 
-        with events.event_loop.register_lock() as register_consumer:
-            self.ctx = register_consumer(Consumer())
-            self.ctx.register(self.ctrl_r, selectors.EVENT_READ)
-
-    def _event(self, key, mask):
-        if key.fileobj == self.ctrl_r:
-            self._handle_ctrl()
-        else:
-            readable = mask & selectors.EVENT_READ
-            writable = mask & selectors.EVENT_WRITE
-            zsh = key.data
-            zsh.event(readable, writable)
+    def notify(self, msg):
+        # we only have one type of message
+        self._trigger_pid(msg)
 
     def _trigger_pid(self, pid):
         if pid not in self.shells:
@@ -347,61 +261,15 @@ class ZshPool:
         zsh = self.shells[pid]
         zsh.queue_send(b'trigger\n')
 
-    def _handle_ctrl(self):
-        msg = self.ctrl_r.recv(4096)
-        for line in msg.splitlines():
-            cmd = line.split(b":")
-            if cmd[0] == b"quit":
-                self._close()
-                return
-            if cmd[0] == b"trigger":
-                self._trigger_pid(int(cmd[1]))
-                continue
-            raise ValueError(f"unknown control message: {cmd}")
-
-    def _close(self):
-        """
-        _close() is only called from the event loop thread.
-        """
-        # this happens on the event loop thread, whether it was triggered by
-        # us reloading or by the event loop reloading
-        with self.closer:
-            if self.closed:
-                return
-            self.closed = True
-
-            self.ctx.unregister(self.ctrl_r)
-            self.ctrl_r.close()
-            self.ctrl_w.close()
-
-            # unregister and close all Zsh objects
-            for zsh in self.shells.values():
-                zsh.close()
-
-            self.closer.notify()
-
-    def close(self):
-        """
-        close() is only called from outside the event loop thread.
-        """
-        with self.closer:
-            if not self.closed:
-                self.ctrl_w.send(b'quit\n')
-                while not self.closed:
-                    self.closer.wait()
-
     def trigger(self, pid):
-        with self.closer:
-            if not self.closed:
-                # print(f'trigger {pid}')
-                self.ctrl_w.send(b'trigger:%d\n'%pid)
+        """trigger() may be called from off-thread"""
+        if self.ctx is not None:
+            self.ctx.notify_me(pid)
 
 
-@singletons.singleton
+@events.singleton
 def zsh_pool():
-    x = ZshPool()
-    yield x
-    x.close()
+    return ZshPool()
 
 
 class ZshTriggerWatch:
