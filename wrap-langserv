@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+
+import socket
+import selectors
+import signal
+import subprocess
+import os
+import sys
+import traceback
+import json
+import time
+
+# TODO: write this in a way which would work on windows
+import fcntl
+
+from langserv import util
+
+red = "\x1b[31m"
+grn = "\x1b[32m"
+yel = "\x1b[33m"
+blu = "\x1b[34m"
+nil = "\x1b[m"
+
+
+with open("/tmp/wrap-langserv.log", "w"):
+    pass
+
+def log(*args, **kwargs):
+    with open("/tmp/wrap-langserv.log", "a") as f:
+        print(*args, **kwargs, file=f)
+
+
+class Connection:
+    """An incoming connection from outside"""
+    def __init__(self, conn, injector, selector):
+        self.conn = conn
+        conn.setblocking(False)
+        self.injector = injector
+        self.selector = selector
+        self.write_buf = b''
+        self.parser = util.Parser(self.handle_conn_msg)
+
+        self.selector.register(self.conn, selectors.EVENT_READ)
+        self.closed = False
+
+    def close(self):
+        self.selector.unregister(self.conn)
+        self.conn.close()
+        self.closed = True
+
+    def write(self, msg):
+        if self.write_buf:
+            self.write_buf += msg
+            return
+        self.write_buf = msg
+        mask = selectors.EVENT_READ | selectors.EVENT_WRITE
+        self.selector.modify(self.conn, mask)
+
+    def event(self, key, mask):
+        readable = mask & selectors.EVENT_READ
+        writable = mask & selectors.EVENT_WRITE
+        if readable:
+            try:
+                msg = self.conn.recv(4096)
+            except ConnectionError:
+                msg = None
+            if not msg:
+                self.close()
+                return
+            log(grn + msg.decode('utf8') + nil)
+            self.parser.feed(msg)
+
+        if writable:
+            n = self.conn.send(self.write_buf)
+            if not n:
+                self.close()
+                return
+            self.write_buf = self.write_buf[n:]
+            if not self.write_buf:
+                self.selector.modify(self.conn, selectors.EVENT_READ)
+
+    def handle_conn_msg(self, content, body, headers):
+        parsed = json.loads(body)
+        # injected messages must have ID's.
+        if "id" not in parsed:
+            raise ValueError(f"no id in {parsed}")
+
+        def cb(_content, _parsed):
+            if not self.closed():
+                self.write(content)
+
+        self.injector.inject_msg(parsed["id"], content, cb)
+
+
+class LanguageServer:
+    """The language server we launch as a subprocess"""
+    def __init__(self, cmd, injector, selector):
+        self.injector = injector
+        self.selector = selector
+        self.parser = util.Parser(self.handle_server_response)
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.write_buf = b""
+
+        fcntl.fcntl(self.proc.stdin.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        fcntl.fcntl(self.proc.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        fcntl.fcntl(self.proc.stderr.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+
+        self.selector.register(self.proc.stdout, selectors.EVENT_READ, self)
+        self.selector.register(self.proc.stderr, selectors.EVENT_READ, self)
+
+    def close(self):
+        self.selector.unregister(self.proc.stdout)
+        self.selector.unregister(self.proc.stderr)
+        if self.write_buf:
+            self.selector.unregister(self.proc.stdin)
+        self.proc.terminate()
+        self.proc.wait()
+        self.proc = None
+
+    def write(self, msg):
+        if self.write_buf:
+            self.write_buf += msg
+            return None
+        self.write_buf = msg
+        self.selector.register(self.proc.stdin, selectors.EVENT_WRITE, self)
+
+    def event(self, key, mask):
+        if key.fileobj in (self.proc.stdin, self.proc.stdout):
+            self.handle_stdio(key, mask)
+        else:
+            self.handle_stderr()
+
+    def handle_stdio(self, key, mask):
+        readable = mask & selectors.EVENT_READ
+        writable = mask & selectors.EVENT_WRITE
+        if readable:
+            msg = self.proc.stdout.raw.read(4096)
+            if not msg:
+                raise ValueError("server died")
+            log(yel + msg.decode('utf8') + nil)
+            self.parser.feed(msg)
+
+        if writable:
+            n = self.proc.stdin.raw.write(self.write_buf)
+            if not n:
+                raise ValueError("server died")
+            self.write_buf = self.write_buf[n:]
+            if not self.write_buf:
+                self.selector.unregister(self.proc.stdin)
+
+    def handle_stderr(self):
+        msg = self.proc.stderr.raw.read(4096)
+        if not msg:
+            raise ValueError("server died")
+        log(red + msg.decode('utf8') + nil, end="")
+
+    def handle_server_response(self, content, body, headers):
+        self.injector.handle_server_response(content, body)
+
+
+class Editor:
+    """The editor which launched us as a subprocess"""
+    def __init__(self, injector, selector):
+        self.injector = injector
+        self.selector = selector
+
+        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        fcntl.fcntl(sys.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        self.write_buf = b""
+        self.selector.register(sys.stdin, selectors.EVENT_READ, self)
+
+        self.parser = util.Parser(self.handle_stdin_msg)
+
+    def write(self, msg):
+        if self.write_buf:
+            self.write_buf += msg
+            return
+        self.write_buf = msg
+        self.selector.register(sys.stdout, selectors.EVENT_WRITE, self)
+
+    def event(self, key, mask):
+        if key.fileobj in (sys.stdin, sys.stdout):
+            self.handle_stdio(key, mask)
+        elif key.fileobj == sys.stderr:
+            self.handle_stderr()
+        else:
+            raise ValueError("bad event")
+
+    def handle_stdio(self, key, mask):
+        readable = mask & selectors.EVENT_READ
+        writable = mask & selectors.EVENT_WRITE
+        if readable:
+            msg = os.read(sys.stdin.fileno(), 4096)
+            if not msg:
+                raise ValueError("stdin from editor failed")
+            self.parser.feed(msg)
+
+        if writable:
+            n = os.write(sys.stdout.fileno(), self.write_buf)
+            if not n:
+                raise ValueError("stdout to editor failed")
+            self.write_buf = self.write_buf[n:]
+            if not self.write_buf:
+                self.selector.unregister(sys.stdout)
+
+    def handle_stdin_msg(self, content, body, headers):
+        # always pass the message to the language server
+        self.injector.handle_editor_msg(content, body)
+
+    def close(self):
+        self.selector.unregister(sys.stdin)
+        if self.write_buf:
+            self.selector.unregister(sys.stdout)
+
+
+class Timeout:
+    def __init__(self, period=1.0):
+        self.period = period
+        self.last = time.time()
+
+    def passed(self):
+        now = time.time()
+        if now > self.last + self.period:
+            self.last = now
+            return True
+        return False
+
+
+class LSPInjector:
+    """Inject traffic between the Editor and LangServ based on Connections"""
+    def __init__(self, cmd, selector):
+        self.selector = selector
+        # connections maps socket connections to Connection objects
+        self.connections = {}
+        # Map id's to Connection objects they originated from.
+        self.injected = {}
+
+        if os.path.exists("/tmp/wrap-langserv.sock"):
+            os.remove("/tmp/wrap-langserv.sock")
+
+        self.listener = socket.socket(family=socket.AF_UNIX)
+        self.listener.setblocking(False)
+        self.listener.bind("/tmp/wrap-langserv.sock")
+        self.listener.listen()
+
+        self.ls = LanguageServer(cmd, self, selector)
+        self.editor = Editor(self, selector)
+
+        self.selector.register(self.listener, selectors.EVENT_READ)
+
+        # talon is a special Connection that we initiate and push updates to
+        self.talon = None
+        self.docsym = None
+        self.id_gen = util.IDGen("injector")
+        self.probe_talon()
+
+    def handle_connection(self):
+        conn, _ = self.listener.accept()
+        self.connections[conn] = Connection(conn, self, self.selector)
+
+    def handle_editor_msg(self, content, body):
+        self.ls.write(content)
+        log(content.decode('utf8'))
+
+        # check for messages  which trigger documentSymbol queries
+        parsed = json.loads(body)
+        if parsed.get("method") in [
+            "textDocument/didOpen",
+            "textDocument/didChange",
+        ]:
+            id = next(self.id_gen)
+            uri = parsed["params"]["textDocument"]["uri"]
+            msg = {
+                "jsonrpc": "2.0",
+                "method": "textDocument/documentSymbol",
+                "id": id,
+                "params": {
+                    "textDocument": {
+                        "uri": uri
+                    }
+                }
+
+            }
+
+            content = util.make_content(msg)
+
+            def docsym_cb(_, _parsed):
+                headers = {"Uri": uri, "Type": "documentSymbol"}
+                _content = util.make_content(_parsed, headers)
+                self.docsym = _content
+                if self.talon is not None:
+                    self.talon.write(_content)
+
+            self.inject_msg(id, content, docsym_cb)
+
+    def inject_msg(self, id, content, cb):
+        self.injected[id] = cb
+        self.ls.write(content)
+        log(blu + content.decode('utf8') + nil)
+
+    def handle_server_response(self, content, body):
+        parsed = json.loads(body)
+        # Do we need to direct this response to a connection?
+        if "id" in parsed and parsed["id"] in self.injected:
+            cb = self.injected.pop(parsed["id"])
+            cb(content, parsed)
+        else:
+            self.editor.write(content)
+
+    def close(self):
+        for conn in self.connections.values():
+            conn.close()
+        self.ls.close()
+        self.editor.close()
+        self.selector.unregister(self.listener)
+        self.listener.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, etype, value, tb):
+        if etype:
+            with open("/tmp/wrap-langserv.log", "a") as f:
+                traceback.print_exception(etype, value, tb, file=f)
+        self.close()
+
+    def run(self):
+        timeout = Timeout(period=1.0)
+        while True:
+            for key, mask in self.selector.select(timeout.period):
+                readable = mask & selectors.EVENT_READ
+                writable = mask & selectors.EVENT_WRITE
+                if key.data == self.editor:
+                    self.editor.event(key, mask)
+                elif key.data == self.ls:
+                    self.ls.event(key, mask)
+                elif key.fileobj == self.listener:
+                    self.handle_connection()
+                elif self.talon and key.fileobj == self.talon.conn:
+                    self.talon.event(key, mask)
+                    if self.talon.closed:
+                        self.talon = None
+                else:
+                    conn = self.connections[key.fileobj]
+                    conn.event(key, mask)
+                    if conn.closed:
+                        del self.connections[key.fileobj]
+            if timeout.passed():
+                self.probe_talon()
+
+    def probe_talon(self):
+        if self.talon is not None:
+            return
+
+        sockpath = "~/.talon/user/rexroni_talon/langserv/langserv.sock"
+        sockpath = os.path.expanduser(sockpath)
+
+        sock = socket.socket(family=socket.AF_UNIX)
+        try:
+            sock.connect(sockpath)
+        except (ConnectionError, FileNotFoundError):
+            sock.close()
+            return
+
+        log('connected to talon!')
+
+        self.talon = Connection(sock, self, self.selector)
+
+        if self.docsym is not None:
+            self.talon.write(self.docsym)
+
+
+def main(cmd):
+    try:
+        with selectors.DefaultSelector() as selector:
+            with LSPInjector(cmd, selector) as injector:
+                injector.run()
+
+    except:
+        with open("/tmp/wrap-langserv.log", "a") as f:
+            traceback.print_exc(file=f)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
