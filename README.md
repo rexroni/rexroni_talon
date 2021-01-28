@@ -8,7 +8,7 @@ Install this repo into your `~/.talon/user` directory like this:
 
 ```sh
 cd ~/.talon/user
-git clone https://github.com/rexroni/rexroni-talon
+git clone https://github.com/rexroni/rexroni_talon
 ```
 
 The current list of features is:
@@ -35,13 +35,13 @@ from zsh for the next phrase.
 All you should have to do is `source` the `setup.zsh` file in your zsh:
 
 ```sh
-source ~/.talon/user/rexroni-talon/zsh-completion-server/setup.zsh
+source ~/.talon/user/rexroni_talon/zsh-completion-server/setup.zsh
 ```
 
 This will have the following effects:
 
 - It will start a completion server served over a unix socket in the
-  `rexroni-talon/zsh-completion-server/sock` directory (created automatically).
+  `rexroni_talon/zsh-completion-server/sock` directory (created automatically).
 
 - It will set your terminal emulator's window title to `zsh:$PID:$PWD`,
   which the `zsh.py` talon module will use to identify which completion
