@@ -15,11 +15,13 @@ import selectors
 import threading
 import traceback
 import logging
+import base64
 
 from .. import singletons
 from .. import events
 from .. import speakify
 from . import util
+from . import docstate
 
 HERE = os.path.dirname(__file__)
 
@@ -33,6 +35,14 @@ ctx.lists["user.langserv_docsym"] = {}
 def langserv_docsym(m) -> str:
     """Returns a langserv_docsym"""
     return m.langserv_docsym
+
+mod.list("langserv_comp", desc="the completions available at the moment")
+ctx.lists["user.langserv_comp"] = {}
+
+@mod.capture(rule="{user.langserv_comp}")
+def langserv_comp(m) -> str:
+    """Returns a langserv_comp"""
+    return m.langserv_comp
 
 
 class LangServ:
@@ -95,6 +105,53 @@ class LangServ:
                 )
             logging.debug(sorted(set(syms.values())))
             ctx.lists["user.langserv_docsym"] = syms
+
+        elif typ == "completion":
+            pretext = headers["Pretext"]
+            pretext = base64.b64decode(pretext.encode('utf8')).decode('utf8')
+            prefix = None
+
+            syms = {}
+
+            # result types: (CompletionItem[] | CompletionList | null)
+            result = parsed.get("result")
+            if result is None:
+                # the null case
+                return
+            if isinstance(result, dict):
+                # the CompletionList case
+                result = result["items"]
+            # the CompletionItem[] case
+            for item in result:
+                item = docstate.CompletionItem(item)
+                # Handle completion info, highest priority first.
+                if item.textEdit is not None:
+                    raise ValueError(
+                        "unsure how to handle CompletionItem.textEdit"
+                    )
+                elif item.insertText is not None:
+                    completion = item.insertText
+                else:
+                    completion = item.label
+
+                # base the prefix off of the first symbol we see
+                if prefix is None:
+                    lcompletion = completion.lower()
+                    lpretext = pretext.lower()
+                    rlen = min(len(pretext), len(completion))
+                    for i in range(rlen, 0, -1):
+                        if lcompletion.startswith(lpretext[-i:]):
+                            prefix = pretext[-i:]
+                            break
+                    else:
+                        prefix = ""
+
+                syms.update(
+                    speakify.get_pronunciations(completion, prefix)
+                )
+            logging.debug(sorted(set(syms.values())))
+            logging.debug(f'prefix: {prefix}')
+            ctx.lists["user.langserv_comp"] = syms
 
 
 class LangServPool(events.EventConsumer):

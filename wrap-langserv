@@ -9,11 +9,12 @@ import sys
 import traceback
 import json
 import time
+import base64
 
 # TODO: write this in a way which would work on windows
 import fcntl
 
-from langserv import util
+from langserv import util, docstate
 
 red = "\x1b[31m"
 grn = "\x1b[32m"
@@ -234,8 +235,10 @@ class LSPInjector:
         self.selector = selector
         # connections maps socket connections to Connection objects
         self.connections = {}
-        # Map id's to Connection objects they originated from.
+        # map id's to callbacks we make to handle the responses
         self.injected = {}
+        # map id's to callbacks we make when we observe responses
+        self.watching = {}
 
         if os.path.exists("/tmp/wrap-langserv.sock"):
             os.remove("/tmp/wrap-langserv.sock")
@@ -250,6 +253,9 @@ class LSPInjector:
 
         self.selector.register(self.listener, selectors.EVENT_READ)
 
+        # map uri's to open Documents
+        self.docs = {}
+
         # talon is a special Connection that we initiate and push updates to
         self.talon = None
         self.docsym = None
@@ -261,39 +267,94 @@ class LSPInjector:
         self.connections[conn] = Connection(conn, self, self.selector)
 
     def handle_editor_msg(self, content, body):
+        # write the message before we even have a chance to inject anything so
+        # that text updates preceed what we inject
         self.ls.write(content)
         log(content.decode('utf8'))
 
-        # check for messages  which trigger documentSymbol queries
         parsed = json.loads(body)
-        if parsed.get("method") in [
-            "textDocument/didOpen",
-            "textDocument/didChange",
-        ]:
-            id = next(self.id_gen)
+        method = parsed.get("method")
+        if method == "textDocument/didOpen":
             uri = parsed["params"]["textDocument"]["uri"]
-            msg = {
-                "jsonrpc": "2.0",
-                "method": "textDocument/documentSymbol",
-                "id": id,
-                "params": {
-                    "textDocument": {
-                        "uri": uri
-                    }
-                }
+            # create a new document
+            text = parsed["params"]["textDocument"]["text"]
+            self.docs[uri] = docstate.Document(text)
 
+            # request documentSymbol
+            self.inject_documentSymbol(uri)
+
+        elif method == "textDocument/didClose":
+            uri = parsed["params"]["textDocument"]["uri"]
+            # discard document state
+            del self.docs[uri]
+
+        elif method == "textDocument/didChange":
+            uri = parsed["params"]["textDocument"]["uri"]
+            # sync changes
+            doc = self.docs[uri]
+            for change in parsed["params"]["contentChanges"]:
+                doc.did_change(docstate.ContentChange(change))
+
+            # request documentSymbol
+            self.inject_documentSymbol(uri)
+
+        elif method == "textDocument/completion":
+            uri = parsed["params"]["textDocument"]["uri"]
+            id = parsed["id"]
+            pos = docstate.Position(parsed["params"]["position"])
+            self.watch_completion(uri, id, pos)
+
+    def inject_documentSymbol(self, uri):
+        id = next(self.id_gen)
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "textDocument/documentSymbol",
+            "id": id,
+            "params": {
+                "textDocument": {
+                    "uri": uri
+                }
             }
 
-            content = util.make_content(msg)
+        }
 
-            def docsym_cb(_, _parsed):
-                headers = {"Uri": uri, "Type": "documentSymbol"}
-                _content = util.make_content(_parsed, headers)
-                self.docsym = _content
-                if self.talon is not None:
-                    self.talon.write(_content)
+        content = util.make_content(msg)
 
-            self.inject_msg(id, content, docsym_cb)
+        def docsym_cb(_, parsed):
+            headers = {"Uri": uri, "Type": "documentSymbol"}
+            _content = util.make_content(parsed, headers)
+            self.docsym = _content
+            if self.talon is not None:
+                self.talon.write(_content)
+
+        self.inject_msg(id, content, docsym_cb)
+
+    def watch_completion(self, uri, id, pos):
+        text = self.docs[uri].text
+        # give talon the line preceeding the completion request, so it can
+        # figure out how much of the word to not type
+        pretext = ""
+        if pos.character > 0:
+            line_start = docstate.Position(line=pos.line, character=0)
+            start = line_start.index(text)
+            end = pos.index(text)
+            pretext = text[start:end]
+        pretext = base64.b64encode(pretext.encode('utf8')).decode('utf8')
+
+        def cb(_, _parsed):
+            headers = {
+                "Uri": uri,
+                "Type": "completion",
+                "Pretext": pretext,
+            }
+            _content = util.make_content(_parsed, headers)
+            if self.talon is not None:
+                self.talon.write(_content)
+
+        self.watch_msg(id, cb)
+
+    def watch_msg(self, id, cb):
+        self.watching[id] = cb
 
     def inject_msg(self, id, content, cb):
         self.injected[id] = cb
@@ -302,12 +363,19 @@ class LSPInjector:
 
     def handle_server_response(self, content, body):
         parsed = json.loads(body)
-        # Do we need to direct this response to a connection?
+        # do we need to direct this response to a connection?
         if "id" in parsed and parsed["id"] in self.injected:
             cb = self.injected.pop(parsed["id"])
             cb(content, parsed)
-        else:
-            self.editor.write(content)
+            return
+
+        self.editor.write(content)
+
+        # did we want that message for something?
+        if "id" in parsed and parsed["id"] in self.watching:
+            cb = self.watching.pop(parsed["id"])
+            cb(content, parsed)
+
 
     def close(self):
         for conn in self.connections.values():
