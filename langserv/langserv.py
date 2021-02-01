@@ -25,24 +25,80 @@ from . import docstate
 
 HERE = os.path.dirname(__file__)
 
+alt_sym = []
+
+def next_sym():
+    global alt_sym
+    if len(alt_sym) < 1:
+        return None
+    alt_sym = alt_sym[1:] + alt_sym[1]
+    return alt_sym[0]
+
+def last_sym():
+    global alt_sym
+    if len(alt_sym) < 1:
+        return None
+    alt_sym = alt_sym[-1] + alt_sym[:-1]
+    return alt_sym[0]
+
+def prefixed_symbol(symbol, prefix):
+    for i in range(len(prefix)):
+        if symbol[i] != prefix[i]:
+            break
+
+    for _ in range(len(prefix) - i):
+        actions.key('backspace')
+
+    return symbol[i:]
+
 ctx = Context()
 mod = Module()
 
 mod.list("langserv_docsym", desc="the symbols present in the open document")
 ctx.lists["user.langserv_docsym"] = {}
 
+mod.list("langserv_comp", desc="the completions available at the moment")
+ctx.lists["user.langserv_comp"] = {}
+
+
 @mod.capture(rule="{user.langserv_docsym}")
 def langserv_docsym(m) -> str:
     """Returns a langserv_docsym"""
-    return m.langserv_docsym
+    global alt_sym
+    if not m.langserv_docsym.startswith("{"):
+        # unambiguous result
+        alt_sym = []
+        return m.langserv_docsym
 
-mod.list("langserv_comp", desc="the completions available at the moment")
-ctx.lists["user.langserv_comp"] = {}
+    edit = speakify.Edit(**json.loads(m.langserv_docsym))
+
+    # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFX,
+    # and prefer all-lowercase, to try to capture variable instance
+    # names more often than class names.
+    alt_sym = list(edit.results.keys())
+    alt_sym.sort(key=lambda x: (edit.results[x], x != x.lower()))
+
+    return prefixed_symbol(alt_sym[0], edit.prefix)
+
 
 @mod.capture(rule="{user.langserv_comp}")
 def langserv_comp(m) -> str:
     """Returns a langserv_comp"""
-    return m.langserv_comp
+    global alt_sym
+    if not m.langserv_comp.startswith("{"):
+        # unambiguous result
+        alt_sym = []
+        return m.langserv_comp
+
+    edit = speakify.Edit(**json.loads(m.langserv_comp))
+
+    # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFX,
+    # and prefer all-lowercase, to try to capture variable instance
+    # names more often than class names.
+    alt_sym = list(edit.results.keys())
+    alt_sym.sort(key=lambda x: (edit.results[x], x != x.lower()))
+
+    return prefixed_symbol(alt_sym[0], edit.prefix)
 
 
 class LangServ:
@@ -96,22 +152,20 @@ class LangServ:
         parsed = json.loads(body)
         typ = headers.get("Type")
         if typ == "documentSymbol":
-            syms = {}
+            speakifier = speakify.Speakifier(prefix="")
             for item in parsed["result"]:
                 sym = item["name"]
                 kind = util.SymbolKind(item["kind"])
-                syms.update(
-                    speakify.get_pronunciations(sym)
-                )
+                speakifier.add_symbol(sym)
+            syms = speakifier.get_talon_list()
             logging.debug(sorted(set(syms.values())))
             ctx.lists["user.langserv_docsym"] = syms
 
         elif typ == "completion":
             pretext = headers["Pretext"]
             pretext = base64.b64decode(pretext.encode('utf8')).decode('utf8')
+            speakifier = None
             prefix = None
-
-            syms = {}
 
             # result types: (CompletionItem[] | CompletionList | null)
             result = parsed.get("result")
@@ -146,9 +200,16 @@ class LangServ:
                     else:
                         prefix = ""
 
-                syms.update(
-                    speakify.get_pronunciations(completion, prefix)
-                )
+                    # Now create the speakifier.
+                    speakifier = speakify.Speakifier(prefix)
+
+                speakifier.add_symbol(completion)
+
+            if speakifier is None:
+                syms = {}
+            else:
+                syms = speakifier.get_talon_list()
+
             logging.debug(sorted(set(syms.values())))
             logging.debug(f'prefix: {prefix}')
             ctx.lists["user.langserv_comp"] = syms
@@ -179,7 +240,7 @@ class LangServPool(events.EventConsumer):
         self.ctx.unregister(self.listener)
         self.listener.close()
 
-        # unregister and close all Zsh objects
+        # unregister and close all LangServ objects
         for ls in self.lang_servs.values():
             ls.close()
 

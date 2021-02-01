@@ -1,6 +1,7 @@
 import re
+import json
 
-def extensions(x):
+def file_extensions(x):
     x = re.sub("\\.py$", " dot pie", x)
     x = re.sub("\\.c$", " dot see", x)
     x = re.sub("\\.h$", " dot h", x)
@@ -8,6 +9,7 @@ def extensions(x):
     x = re.sub("\\.zsh$", " dot z s h", x)
     x = re.sub("\\.go$", " dot go", x)
     return x
+
 
 def numbers(x):
     x = x.replace("0", " zero ")
@@ -22,7 +24,8 @@ def numbers(x):
     x = x.replace("9", " nine ")
     return x
 
-def speakify(x, specials):
+
+def punctuation(x, specials):
     specials = specials or ""
     x = re.sub("\\.", " dot " if '.' in specials else ' ', x)
     x = re.sub("_", " under " if '_' in specials else ' ', x)
@@ -33,81 +36,145 @@ def speakify(x, specials):
     # talon also pukes on leading spaces
     return x.strip()
 
-def get_pronunciations(symbol, prefix="", completer_char=None):
-    r"""
-    guess reasonable pronunciations for a symbol.
 
-    arguments:
-        symbol:
-            the complete symbol to be pronounced.  If neither prefix nor
-            edit are provided this will also be the text emitted by talon.
-        prefix:
-            the prefix which has already been typed.  This will effectively
-            be removed from the symbol before emitting text.
-        completer_char:
-            a character to type after typing out a shortened version of a
-            text, such as \t to invoke shell completion.  If not provided,
-            no shortened symbols will be generated.
+FULL = 1
+NOPREFIX = 2
+SHORTHAND = 3
+SHORTHAND_NOPREFIX = 4
+
+
+class Edit:
+    """A compound type sometimes returned by a Speakifier talon list."""
+    def __init__(self, prefix, results):
+        self.prefix = prefix
+        self.results = results
+
+
+class Speakifier:
     """
-    out = {}
+    Speakifier calculates possible pronunciations from a set of symbols.  The
+    general rule is that a symbol should be pronouncable by speaking just the
+    plain words in a symbol, or by speaking them with explicit punctuation.
 
-    # We'll never re-type the prefix, ever.
-    typable = symbol[len(prefix):]
+    Examples:
+        big_long/file-name -> big long file name,
+                              big under long slash file dash name
+        dos2unix -> dos two unix
+        c99 -> c nine nine
 
-    # If there is a symbol in the prefix, we never allow pronouncing before it.
-    # Think of pronouncing "--amend" when "--" is the prefix or "a/b" when "a/"
-    # is the prefix.  You wouldn't.
-    symboled_prefix = re.match('(.*[0-9._/-])[^0-9._/-]*$', prefix)
-    if symboled_prefix:
-        symboled_prefix = symboled_prefix[1]
-        symbol = symbol[len(symboled_prefix):]
-        prefix = prefix[len(symboled_prefix):]
+    Each symbol added to the speakifier is assumed to be unique, though its
+    pronuncataion may not be unique.
 
-    # Now, if you have half-typed a word to narrow down the completion options,
-    # support either the full (remaining) symbol, or just the part that is
-    # remaining.
-    variations = [(symbol, typable)]
-    if prefix:
-        variations.append((symbol[len(prefix):], typable))
+    Examples, with prefix="my_dir/":
+        my_dir/some-file -> some file
+                            some dash file
+        my_dir/other-file -> other file
+                             other dash file
 
-    # Now, in case you want to pronounce just until the next symbol, we'll
-    # support typing that out and we'll type a tab afterwards to trigger the
-    # shell's tab completion (which allows us to not manually track prefixes)
-    shorthand = re.match('^([^0-9._/-]*)[0-9._/-].*$', symbol)
-    if shorthand and completer_char is not None:
-        shorthand = shorthand[1]
-        shortened_by = len(symbol) - len(shorthand)
-        typable = typable[:-shortened_by] + completer_char
+    If the prefix contains just text, allowable pronunciations include the
+    symbol with and without the prefix.
 
-        variations.append((shorthand, typable))
-        if prefix:
-            shorthand = re.match(
-                '^([^0-9._/-]*)[0-9._/-].*$', symbol[len(prefix):]
-            )
-            if shorthand:
-                shorthand = shorthand[1]
-                variations.append((shorthand, typable))
+    Examples, with prefix="my":
+        my_variable -> my variable        # plain words of "my_variable"
+                       my under variable  # explicit form of "my_variable"
+                       variable           # plain form of "_variable"
+                       under variable     # plain form of "variable"
 
-    for base, result in variations:
-        if not base:
-            continue
+    Finally, similar to tab-completion, speaking the first word of a multi-word
+    symbol is allowed.
+
+    Examples:
+        big_long/file-name -> big
+        dos2unix -> dos
+        c99 -> c
+    """
+    def __init__(self, prefix=""):
+        self.prefix = prefix
+
+        # If there is a symbol in the prefix, we never allow pronouncing before
+        # it.  Think of pronouncing "--amend" when "--" is the prefix or "a/b"
+        # when "a/" is the prefix.  You wouldn't.
+        symboled_prefix = re.match('(.*[0-9._/-])[^0-9._/-]*$', prefix)
+        if symboled_prefix:
+            self.dont_speak = len(symboled_prefix[1])
+        else:
+            self.dont_speak = 0
+
+        # pronounce maps pronunciations into lists of matching typable symbols.
+        self.pronounce = {}
+        self.edits = {}
+
+    def _add_pronunciation(self, speakable, symbol, kind):
+        kinds = self.pronounce.setdefault(speakable, {})
+        kinds[symbol] = min(kinds.get(symbol, kind), kind)
+
+    def _gen_variations(self, speakable, symbol, kind):
+        if not speakable:
+            return
 
         # always start with pronouncing file extensions
-        base = extensions(base)
+        speakable = file_extensions(speakable)
 
         # always separate numbers into individual digits
-        base = numbers(base)
+        speakable = numbers(speakable)
 
         # then try to support the plainest form
-        out[speakify(base, None)] = result
+        self._add_pronunciation(punctuation(speakable, None), symbol, kind)
 
         # support the most explicit form
-        out[speakify(base, '._-/')] = result
+        self._add_pronunciation(punctuation(speakable, '._-/'), symbol, kind)
 
         # support the one-of-each forms
-        out[speakify(base, '.')] = result
-        out[speakify(base, '_')] = result
-        out[speakify(base, '-')] = result
-        out[speakify(base, '/')] = result
+        self._add_pronunciation(punctuation(speakable, '.'), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, '_'), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, '-'), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, '/'), symbol, kind)
 
-    return out
+    def add_symbol(self, symbol):
+        """Register a unique symbol with the speakifier"""
+        speakable = symbol[self.dont_speak:]
+        prefix = self.prefix[self.dont_speak:]
+
+        # Support speaking the full symbol (minus dont_speak).
+        self._gen_variations(speakable, symbol, FULL)
+
+        # Now, if you have half-typed a word to narrow down the completion
+        # options, support either the full (remaining) symbol, or just the part
+        # that is remaining.
+        if prefix:
+            self._gen_variations(speakable[len(prefix):], symbol, NOPREFIX)
+
+        # Figure out what shorthand variations are allowed.
+
+        # Now, in case you want to pronounce just until the next symbol, we'll
+        # support that shorthand pronunciation.
+        shorthand = re.match('^([^0-9._/-]*)[0-9._/-].*$', speakable)
+        if shorthand:
+            shorthand = shorthand[1]
+            self._gen_variations(shorthand, symbol, SHORTHAND)
+
+            # Also support the shorthand of the symbol without the prefix.
+            if len(prefix) < len(shorthand):
+                self._gen_variations(
+                    shorthand[len(prefix):], symbol, SHORTHAND_NOPREFIX
+                )
+
+    def get_talon_list(self):
+        """
+        Return a talon-list-ready dictionary of pronuncations.
+
+        Any pronunciation with ambiguity or editing required shall return a
+        json-encoded result, which must be processed at word-selection-time.
+        """
+        out = {}
+        for speakable, results in self.pronounce.items():
+            if len(results) == 1:
+                symbol = next(iter(results.keys()))
+                if symbol.startswith(self.prefix):
+                    # unambiguous choice with no special editing required.
+                    out[speakable] = symbol[len(self.prefix):]
+                    continue
+            out[speakable] = json.dumps(
+                vars(Edit(prefix=self.prefix, results=results))
+            )
+        return out

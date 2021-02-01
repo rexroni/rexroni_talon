@@ -12,7 +12,7 @@ show: key(ctrl-g)
 <user.shell_command>:
     insert(user.shell_command)
 
-<user.zsh_completion>:
+^<user.zsh_completion>:
     insert(user.zsh_completion)
 
 above: insert("../")

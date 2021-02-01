@@ -54,7 +54,20 @@ def shell_command(m) -> str:
 @mod.capture(rule="{user.zsh_completion}")
 def zsh_completion(m) -> str:
     """Returns a zsh_completion"""
-    return m.zsh_completion
+    if not m.zsh_completion.startswith("{"):
+        # unambiguous result
+        alt_sym = []
+        return m.zsh_completion
+
+    edit = speakify.Edit(**json.loads(m.zsh_completion))
+
+    # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFX.
+    options = list(edit.results.keys())
+    options.sort(key=lambda x: (edit.results[x], x != x.lower()))
+
+    # Take the first option and hope tab completion is helpful.
+    symbol = options[0]
+    return symbol[len(edit.prefix):] + "\t"
 
 
 _typed_special = False
@@ -192,22 +205,17 @@ class Zsh:
         ]:
             raw_completions = []
 
-        completions = {}
+        speakifier = speakify.Speakifier(prefix.decode("utf8"))
         for symbol in raw_completions:
-            completions.update(
-                speakify.get_pronunciations(
-                    symbol.decode("utf8"),
-                    prefix.decode("utf8"),
-                    completer_char="\t",
-                )
-            )
+            speakifier.add_symbol(symbol.decode("utf8"))
+        completions = speakifier.get_talon_list()
 
         # cache these completions for later
         self.completions = completions
         # if we are active, update the list of zsh_completions
         if self.is_active_window():
             logging.debug(completions)
-            ctx.lists["user.zsh_completion"] = self.completions
+            ctx.lists["user.zsh_completion"] = completions
 
     def is_active_window(self):
         window = ui.active_window()
