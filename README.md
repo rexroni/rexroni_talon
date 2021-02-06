@@ -90,7 +90,52 @@ Language Server Protocol messages and informs Talon about editor information.
 - You'll need an editor which uses the Language Server Protocol (LSP) for its
   language integrations.  LSP is popular, so you're probably in luck.
 
-### Editor configuration:
+### Environment Variable Configuration
+
+**The "PATH hack"**: This step is optional but recommended.  You can save
+yourself the pain of mucking around in your editor settings to change how
+your editor invokes your language server, as long as your language server
+uses a dedicated executable.  That is, `pyls` is fine but `flow lsp` is not
+because it is not a dedicated executable.
+
+Just add this line to your `.bashrc` or `.zshrc` or wherever you customize your
+`PATH` environment variable:
+
+```sh
+export PATH="$HOME/.talon/user/rexroni_talon/langserv/path-hack:$PATH"
+```
+
+Then log out and log back in for the `PATH` setting to take effect.
+
+The PATH hack will automatically integrate talon with the following language
+servers, if they are installed on your system:
+
+- `pyls`
+- `clangd`
+- `rls`
+- `bashls`
+- `golsp`
+- `gopls`
+- `jdtls`
+- `lsp-tsserverr`
+- `typescript-language-server`
+- `javascript-typescript-langserver`
+- `phpls`
+- `intelephens-ls`
+- `elixir-ls`
+- `erlang-ls`
+
+More can be added by running:
+
+```sh
+cd $HOME/.talon/user/rexroni_talon/langserv/path-hack
+ln -s ../../wrap-langserv my-language-server-binary
+```
+
+### Editor configuration
+
+If you did the PATH hack, all that's left in the editor is to install a
+language server client.
 
 - **Vim**:
 
@@ -101,13 +146,13 @@ Language Server Protocol messages and informs Talon about editor information.
   1. Install a language server like `pyls` (for python) or `clangd` (for C/C++)
      through your system's package manager.
 
-  1. Configure `vim-lsp` in your `~/.vimrc`:
+  1. Configure `vim-lsc` in your `~/.vimrc`:
 
      ```vim
-     " Wrap each language server with wrap-langserv.
+     " Enable some language servers:
      let g:lsc_server_commands = {
-      \ 'python': $HOME.'/.talon/user/rexroni_talon/wrap-langserv pyls',
-      \ 'c': $HOME.'/.talon/user/rexroni_talon/wrap-langserv clangd',
+      \ 'python': 'pyls',
+      \ 'c': 'clangd',
       \ }
 
      " Trigger autocomplete after a single letter when it is not triggered by
@@ -117,13 +162,24 @@ Language Server Protocol messages and informs Talon about editor information.
      """""""
      " If you do not want the usual features of a language server but only want
      " it for the Talon integration, you can turn off most of the features.
-     " I highly recommend reading through the vim-lsp documentation before
+     " I highly recommend reading through the vim-lsc documentation before
      " long, but this will get you started:
      let g:lsc_auto_map = v:false
      set completeopt-=preview
      let g:lsc_reference_highlights = v:false
      let g:lsc_enable_diagnostics = v:false
      """""""
+     ```
+
+  1. If you did not do the PATH hack, you can configure vim-lsc to invoke
+     `wrap-langserv` directly:
+
+     ```vim
+     " Wrap each language server with wrap-langserv:
+     let g:lsc_server_commands = {
+      \ 'python': $HOME.'/.talon/user/rexroni_talon/wrap-langserv pyls',
+      \ 'c': $HOME.'/.talon/user/rexroni_talon/wrap-langserv clangd',
+      \ }
      ```
 
 - **Sublime**:
@@ -136,10 +192,8 @@ Language Server Protocol messages and informs Talon about editor information.
   1. Enable a couple of plugins, like `pyls` and `clangd`, via the
      `LSP: Enable Langauge Server Globally` command in the Command Pallette.
 
-  1. Visit your `Preferences: LSP Settings`.
-
-  1. In the user settings, set the `clients` for each client to have a new
-     `command` setting that wraps each language server with `wrap-langserv`:
+  1. If you did not do the PATH hack, you can configure vim-lsc to invoke
+     `wrap-langserv` directly from your `Preferences: LSP Settings`.
 
      ```json
      {
@@ -158,6 +212,27 @@ Language Server Protocol messages and informs Talon about editor information.
          }
      }
      ```
+
+- **VSCode**:
+
+  Amazingly, even though Microsoft invented the Language Server Protocol as an
+  elegant abstraction between the editor and the language plugins, they tend to
+  blur the lines of their own abstraction in their language extensions, making it
+  nearly impossible for `wrap-langserv` to function.
+
+  Notably, the following extensions are known *not* to work:
+
+  - The Python extension (vscode-python)
+  - The built-in JavaScript and TypeScript plugins
+
+  On the plus side, some third-party plugins have more standard behavior and
+  should work just fine:
+
+  - The Clangd extension (llvm-vs-code-extensions)
+  - The official Go extension (golang)
+
+  For the extensions that do work, the PATH hack is the only necessary
+  configuration.
 
 ### First steps
 

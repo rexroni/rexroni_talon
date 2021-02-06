@@ -10,6 +10,7 @@ import traceback
 import json
 import time
 import base64
+import re
 
 # TODO: write this in a way which would work on windows
 import fcntl
@@ -452,4 +453,20 @@ def main(cmd):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    # check for path hack
+    executable = os.path.basename(sys.argv[0])
+    if executable != "wrap-langserv":
+        # insert the name of the executable we were called with before the args
+        args = [executable] + sys.argv[1:]
+    else:
+        args = sys.argv[1:]
+
+    # regardless of the path hack, always remove the path hack before calling
+    # the subprocess, in case the path hack is active but we were invoked
+    # directly
+    path = os.environ.get("PATH")
+    if path is not None:
+        path = re.sub("[^:]*/langserv/path-hack/?:", "", path)
+        os.environ["PATH"] = path
+
+    main(args)
