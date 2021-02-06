@@ -42,6 +42,9 @@ def last_sym():
     return alt_sym[0]
 
 def prefixed_symbol(symbol, prefix):
+    if len(prefix) == 0:
+        return symbol
+
     for i in range(len(prefix)):
         if symbol[i] != prefix[i]:
             break
