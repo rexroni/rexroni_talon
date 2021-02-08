@@ -190,10 +190,10 @@ class POD:
         else:
             attrs = iter(vars(self))
         for attr in attrs:
-            val = getattr(self, attr)
-            if type(type(val)) is PODMeta:
-                val = val.to_dict(explicit_nones)
-            out[attr] = val
+            value = getattr(self, attr)
+            if isinstance(value, POD):
+                value = value.to_dict(explicit_nones)
+            out[attr] = value
         return out
 
     def __repr__(self) -> str:

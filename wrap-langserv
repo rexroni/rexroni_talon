@@ -23,7 +23,6 @@ yel = "\x1b[33m"
 blu = "\x1b[34m"
 nil = "\x1b[m"
 
-
 with open("/tmp/wrap-langserv.log", "w"):
     pass
 
@@ -103,6 +102,8 @@ class LanguageServer:
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        self.expect_exit = False
+        self.exit_code = None
         self.write_buf = b""
 
         fcntl.fcntl(self.proc.stdin.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
@@ -112,16 +113,25 @@ class LanguageServer:
         self.selector.register(self.proc.stdout, selectors.EVENT_READ, self)
         self.selector.register(self.proc.stderr, selectors.EVENT_READ, self)
 
+        self.stdout_drained = False
+        self.stderr_drained = False
+
     def close(self):
-        self.selector.unregister(self.proc.stdout)
-        self.selector.unregister(self.proc.stderr)
+        if self.proc is None:
+            return
+        if not self.stdout_drained:
+            self.selector.unregister(self.proc.stdout)
+        if not self.stderr_drained:
+            self.selector.unregister(self.proc.stderr)
         if self.write_buf:
             self.selector.unregister(self.proc.stdin)
         self.proc.terminate()
-        self.proc.wait()
+        self.exit_code = self.proc.wait()
         self.proc = None
 
     def write(self, msg):
+        if self.proc == None:
+            raise ValueError("can't write to dead server")
         if self.write_buf:
             self.write_buf += msg
             return None
@@ -129,37 +139,52 @@ class LanguageServer:
         self.selector.register(self.proc.stdin, selectors.EVENT_WRITE, self)
 
     def event(self, key, mask):
-        if key.fileobj in (self.proc.stdin, self.proc.stdout):
-            self.handle_stdio(key, mask)
-        else:
-            self.handle_stderr()
-
-    def handle_stdio(self, key, mask):
         readable = mask & selectors.EVENT_READ
         writable = mask & selectors.EVENT_WRITE
-        if readable:
+        # stdout
+        if readable and key.fileobj == self.proc.stdout:
             msg = self.proc.stdout.raw.read(4096)
             if not msg:
-                raise ValueError("server died")
+                if not self.expect_exit:
+                    raise ValueError("server died")
+                self.stdout_drained = True
+                self.selector.unregister(self.proc.stdout)
+                return
             log(yel + msg.decode('utf8') + nil)
             self.parser.feed(msg)
 
+        # stderr
+        if readable and key.fileobj == self.proc.stderr:
+            msg = self.proc.stderr.raw.read(4096)
+            if not msg:
+                if not self.expect_exit:
+                    raise ValueError("server died")
+                self.stderr_drained = True
+                self.selector.unregister(self.proc.stderr)
+                return
+            self.injector.handle_server_error(msg)
+
+        # stdin
         if writable:
             n = self.proc.stdin.raw.write(self.write_buf)
             if not n:
-                raise ValueError("server died")
+                if not self.expect_exit:
+                    raise ValueError("server died")
+                self.write_buf = b""
+                self.selector.unregister(self.proc.stdin)
+                return
             self.write_buf = self.write_buf[n:]
             if not self.write_buf:
                 self.selector.unregister(self.proc.stdin)
 
-    def handle_stderr(self):
-        msg = self.proc.stderr.raw.read(4096)
-        if not msg:
-            raise ValueError("server died")
-        log(red + msg.decode('utf8') + nil, end="")
-
     def handle_server_response(self, content, body, headers):
         self.injector.handle_server_response(content, body)
+
+    def gather(self):
+        if self.stdout_drained and self.stderr_drained and not self.write_buf:
+            self.close()
+            return True
+        return False
 
 
 class Editor:
@@ -171,6 +196,7 @@ class Editor:
         fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
         fcntl.fcntl(sys.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
         self.write_buf = b""
+        self.err_buf = b""
         self.selector.register(sys.stdin, selectors.EVENT_READ, self)
 
         self.parser = util.Parser(self.handle_stdin_msg)
@@ -182,30 +208,40 @@ class Editor:
         self.write_buf = msg
         self.selector.register(sys.stdout, selectors.EVENT_WRITE, self)
 
-    def event(self, key, mask):
-        if key.fileobj in (sys.stdin, sys.stdout):
-            self.handle_stdio(key, mask)
-        elif key.fileobj == sys.stderr:
-            self.handle_stderr()
-        else:
-            raise ValueError("bad event")
+    def write_err(self, msg):
+        if self.err_buf:
+            self.err_buf += msg
+            return
+        self.err_buf = msg
+        self.selector.register(sys.stderr, selectors.EVENT_WRITE, self)
 
-    def handle_stdio(self, key, mask):
+    def event(self, key, mask):
         readable = mask & selectors.EVENT_READ
         writable = mask & selectors.EVENT_WRITE
+        # stdin
         if readable:
             msg = os.read(sys.stdin.fileno(), 4096)
             if not msg:
                 raise ValueError("stdin from editor failed")
             self.parser.feed(msg)
 
-        if writable:
+        # stdout
+        if writable and key.fileobj == sys.stdout:
             n = os.write(sys.stdout.fileno(), self.write_buf)
             if not n:
                 raise ValueError("stdout to editor failed")
             self.write_buf = self.write_buf[n:]
             if not self.write_buf:
                 self.selector.unregister(sys.stdout)
+
+        # stderr
+        if writable and key.fileobj == sys.stderr:
+            n = os.write(sys.stderr.fileno(), self.err_buf)
+            if not n:
+                raise ValueError("stderr to editor failed")
+            self.err_buf = self.err_buf[n:]
+            if not self.err_buf:
+                self.selector.unregister(sys.stderr)
 
     def handle_stdin_msg(self, content, body, headers):
         # always pass the message to the language server
@@ -215,6 +251,10 @@ class Editor:
         self.selector.unregister(sys.stdin)
         if self.write_buf:
             self.selector.unregister(sys.stdout)
+
+    def gather(self):
+        # don't exit until we have drained write_buf and err_buf
+        return all([not self.write_buf, not self.err_buf])
 
 
 class Timeout:
@@ -251,6 +291,8 @@ class LSPInjector:
 
         self.ls = LanguageServer(cmd, self, selector)
         self.editor = Editor(self, selector)
+
+        self.want_exit = False
 
         self.selector.register(self.listener, selectors.EVENT_READ)
 
@@ -305,6 +347,10 @@ class LSPInjector:
             pos = docstate.Position(parsed["params"]["position"])
             self.watch_completion(uri, id, pos)
 
+        elif method == "exit":
+            self.ls.expect_exit = True
+            self.want_exit = True
+
     def inject_documentSymbol(self, uri):
         id = next(self.id_gen)
         msg = {
@@ -316,7 +362,6 @@ class LSPInjector:
                     "uri": uri
                 }
             }
-
         }
 
         content = util.make_content(msg)
@@ -377,6 +422,11 @@ class LSPInjector:
             cb = self.watching.pop(parsed["id"])
             cb(content, parsed)
 
+    def handle_server_error(self, msg):
+        # log the message in red
+        log(red + msg.decode('utf8') + nil, end="")
+        # pass the message to the editor.
+        self.editor.write_err(msg)
 
     def close(self):
         for conn in self.connections.values():
@@ -390,14 +440,11 @@ class LSPInjector:
         return self
 
     def __exit__(self, etype, value, tb):
-        if etype:
-            with open("/tmp/wrap-langserv.log", "a") as f:
-                traceback.print_exception(etype, value, tb, file=f)
         self.close()
 
     def run(self):
         timeout = Timeout(period=1.0)
-        while True:
+        while not self.gather():
             for key, mask in self.selector.select(timeout.period):
                 readable = mask & selectors.EVENT_READ
                 writable = mask & selectors.EVENT_WRITE
@@ -418,6 +465,14 @@ class LSPInjector:
                         del self.connections[key.fileobj]
             if timeout.passed():
                 self.probe_talon()
+
+    def gather(self):
+        # see if we are ready to exit
+        return all([
+            self.want_exit,
+            self.editor.gather(),
+            self.ls.gather(),
+        ])
 
     def probe_talon(self):
         if self.talon is not None:
@@ -442,15 +497,23 @@ class LSPInjector:
 
 
 def main(cmd):
+    exit_code = 0
     try:
         with selectors.DefaultSelector() as selector:
             with LSPInjector(cmd, selector) as injector:
                 injector.run()
 
-    except:
+            if injector.ls.exit_code is not None:
+                exit_code = injector.ls.exit_code
+
+    except Exception as e:
         with open("/tmp/wrap-langserv.log", "a") as f:
             traceback.print_exc(file=f)
+        # We're out of the event loop, but still give the editor a one-liner
+        print(e, file=sys.stderr)
+        exit(1)
 
+    exit(exit_code)
 
 if __name__ == "__main__":
     # check for path hack
