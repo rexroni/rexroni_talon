@@ -31,7 +31,7 @@ ctx.lists["user.zsh_completion"] = {}
 mod.list("shell_command", desc="user shell commands")
 ctx.lists["user.shell_command"] = {
     "less": "less",
-    "ls": "ls",
+    "ell ess": "ls",
     "cd": "cd",
     "vim": "vim",
     "git": "git",
@@ -41,10 +41,9 @@ ctx.lists["user.shell_command"] = {
     "g": "g",
     "grep": "grep",
     "excel": "xsel",
-    "rm": "rm",
+    "remove": "rm",
     "make dir": "mkdir",
-    "remove dir": "rmdir",
-    "move": "mv",
+    "remove directory": "rmdir",
 }
 
 @mod.capture(rule="{user.shell_command}")
@@ -62,15 +61,24 @@ def zsh_completion(m) -> str:
 
     edit = speakify.Edit(**json.loads(m.zsh_completion))
 
-    # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFX.
+    # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFIX.
     options = list(edit.results.keys())
-    options.sort(key=lambda x: (edit.results[x][0], x != x.lower()))
+    options.sort(key=lambda x: (edit.results[x], x != x.lower()))
 
-    # Take the source text that generated the first option.
-    kind, src = edit.results[options[0]]
+    # Take the first option and hope tab completion is helpful.
+    symbol = options[0]
 
-    # Hope tab completion is helpful.
-    return src[len(edit.prefix):] + "\t"
+    # in the case of SHORTHAND or SHORTHAND_NOPREFIX, try to get the longest
+    # common component of the symbol which is common to all options.
+    kind = edit.results[symbol]
+    if kind in (speakify.SHORTHAND, speakify.SHORTHAND_NOPREFIX):
+        max_len = min(len(o) for o in options)
+        lowered = [o[:max_len].lower() for o in options]
+        for i in range(max_len):
+            if not all(lowered[0][i] == l[i] for l in lowered[1:]):
+                break
+        symbol = symbol[:i]
+    return symbol[len(edit.prefix):] + "\t"
 
 
 _typed_special = False
