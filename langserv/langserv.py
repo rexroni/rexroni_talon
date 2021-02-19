@@ -79,7 +79,7 @@ def langserv_docsym(m) -> str:
     # and prefer all-lowercase, to try to capture variable instance
     # names more often than class names.
     alt_sym = list(edit.results.keys())
-    alt_sym.sort(key=lambda x: (edit.results[x], x != x.lower()))
+    alt_sym.sort(key=lambda x: (edit.results[x][0], x != x.lower()))
 
     return prefixed_symbol(alt_sym[0], edit.prefix)
 
@@ -99,7 +99,7 @@ def langserv_comp(m) -> str:
     # and prefer all-lowercase, to try to capture variable instance
     # names more often than class names.
     alt_sym = list(edit.results.keys())
-    alt_sym.sort(key=lambda x: (edit.results[x], x != x.lower()))
+    alt_sym.sort(key=lambda x: (edit.results[x][0], x != x.lower()))
 
     return prefixed_symbol(alt_sym[0], edit.prefix)
 

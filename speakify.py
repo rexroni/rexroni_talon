@@ -104,13 +104,18 @@ class Speakifier:
         self.pronounce = {}
         self.edits = {}
 
-    def _add_pronunciation(self, speakable, symbol, kind):
+    def _add_pronunciation(self, speakable, symbol, kind, src):
         kinds = self.pronounce.setdefault(speakable, {})
-        kinds[symbol] = min(kinds.get(symbol, kind), kind)
+        # prefer the lowest kind, if one is present
+        if symbol in kinds and kind > kinds[symbol][0]:
+            return
+        kinds[symbol] = (kind, src)
 
     def _gen_variations(self, speakable, symbol, kind):
         if not speakable:
             return
+
+        src = speakable
 
         # always start with pronouncing file extensions
         speakable = file_extensions(speakable)
@@ -119,16 +124,16 @@ class Speakifier:
         speakable = numbers(speakable)
 
         # then try to support the plainest form
-        self._add_pronunciation(punctuation(speakable, None), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, None), symbol, kind, src)
 
         # support the most explicit form
-        self._add_pronunciation(punctuation(speakable, '._-/'), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, '._-/'), symbol, kind, src)
 
         # support the one-of-each forms
-        self._add_pronunciation(punctuation(speakable, '.'), symbol, kind)
-        self._add_pronunciation(punctuation(speakable, '_'), symbol, kind)
-        self._add_pronunciation(punctuation(speakable, '-'), symbol, kind)
-        self._add_pronunciation(punctuation(speakable, '/'), symbol, kind)
+        self._add_pronunciation(punctuation(speakable, '.'), symbol, kind, src)
+        self._add_pronunciation(punctuation(speakable, '_'), symbol, kind, src)
+        self._add_pronunciation(punctuation(speakable, '-'), symbol, kind, src)
+        self._add_pronunciation(punctuation(speakable, '/'), symbol, kind, src)
 
     def add_symbol(self, symbol):
         """Register a unique symbol with the speakifier"""
@@ -164,7 +169,7 @@ class Speakifier:
         Return a talon-list-ready dictionary of pronuncations.
 
         Any pronunciation with ambiguity or editing required shall return a
-        json-encoded result, which must be processed at word-selection-time.
+        json-encoded result, which must be processed at word-selection time.
         """
         out = {}
         for speakable, results in self.pronounce.items():
@@ -178,3 +183,25 @@ class Speakifier:
                 vars(Edit(prefix=self.prefix, results=results))
             )
         return out
+
+
+if __name__ == "__main__":
+    speakifier = Speakifier(prefix="")
+    speakifier.add_symbol("my-file-1")
+    speakifier.add_symbol("my-file-2")
+    speakifier.add_symbol("my-file-3")
+    out = speakifier.get_talon_list()
+
+    exp_results = {
+        "my-file-1": [SHORTHAND, "my"],
+        "my-file-2": [SHORTHAND, "my"],
+        "my-file-3": [SHORTHAND, "my"]
+    }
+    exp_edit = Edit(prefix="", results=exp_results)
+
+    assert json.loads(out["my"]) == vars(exp_edit), (
+        "output for SHORTHAND results 'my':\n"
+        + out["my"]
+        + "does not match expected value:\n"
+        + json.dumps(vars(exp_edit))
+    )

@@ -43,7 +43,8 @@ ctx.lists["user.shell_command"] = {
     "excel": "xsel",
     "rm": "rm",
     "make dir": "mkdir",
-    "rmdir": "rmdir",
+    "remove dir": "rmdir",
+    "move": "mv",
 }
 
 @mod.capture(rule="{user.shell_command}")
@@ -63,11 +64,13 @@ def zsh_completion(m) -> str:
 
     # Prefer FULL to NOPREFIX to SHORTHAND to SHORTHAND_NOPREFX.
     options = list(edit.results.keys())
-    options.sort(key=lambda x: (edit.results[x], x != x.lower()))
+    options.sort(key=lambda x: (edit.results[x][0], x != x.lower()))
 
-    # Take the first option and hope tab completion is helpful.
-    symbol = options[0]
-    return symbol[len(edit.prefix):] + "\t"
+    # Take the source text that generated the first option.
+    kind, src = edit.results[options[0]]
+
+    # Hope tab completion is helpful.
+    return src[len(edit.prefix):] + "\t"
 
 
 _typed_special = False
